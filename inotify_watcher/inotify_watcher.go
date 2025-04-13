@@ -371,6 +371,68 @@ func (w *Inotify) readEvents() {
 	}
 
 }
+
+func (w *Inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[unix.SizeofInotifyEvent * 4096]byte, offset uint32) (Event, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	watch := w.watches.byWd(uint32(inEvent.Wd))
+	if watch == nil {
+		return Event{}, true
+	}
+	// wd := inEvent.Wd
+	mask := inEvent.Mask
+	nameLen := inEvent.Len
+
+	var name string
+	if nameLen > 0 {
+		bytes := (*[unix.PathMax]byte)(unsafe.Pointer(&buf[offset+unix.SizeofInotifyEvent]))
+		name = string(bytes[:nameLen])
+		name = strings.TrimRight(name, "\x00")
+	}
+
+	// watch := w.watches.byWd(uint32(wd))
+	// if watch == nil {
+	// 	return Event{}, true
+	// }
+
+	fullPath := watch.path
+	if name != "" {
+		fullPath = filepath.Join(fullPath, name)
+	}
+	isDir := inEvent.Mask&unix.IN_ISDIR == unix.IN_ISDIR
+
+	switch {
+	case inEvent.Mask&unix.IN_IGNORED != 0 || inEvent.Mask&unix.IN_UNMOUNT != 0:
+		w.watches.remove(watch)
+		return Event{}, true
+	case inEvent.Mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF:
+		w.watches.remove(watch)
+	case inEvent.Mask&unix.IN_MOVE_SELF == unix.IN_MOVE_SELF && !watch.recurse:
+		if err := w.remove(watch.path); err != nil && !errors.Is(err, ErrNonExistentWatch) {
+			if !w.sendError(err) {
+				return Event{}, false
+			}
+		}
+	}
+
+	if watch.recurse && isDir && (inEvent.Mask&unix.IN_CREATE != 0) {
+		if err := w.register(fullPath, watch.flags, true); err != nil {
+			if !w.sendError(err) {
+				return Event{}, false
+			}
+
+		}
+	}
+
+	event := Event{
+		Name: fullPath,
+		Op:   mask,
+	}
+
+	return event, true
+}
+
 func recursivePath(path string) (string, bool) {
 	path = filepath.Clean(path)
 	if filepath.Base(path) == "..." {

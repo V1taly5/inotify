@@ -1,6 +1,40 @@
+package inotify
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+// TODO
+// type Op uint32 for unix.IN_ANY
+const (
+	Create     = unix.IN_CREATE
+	Write      = unix.IN_MODIFY
+	Remove     = unix.IN_DELETE
+	Rename     = unix.IN_MOVED_TO | unix.IN_MOVED_FROM
+	Movedto    = unix.IN_MOVED_TO
+	Movedfrom  = unix.IN_MOVED_FROM
+	Chmod      = unix.IN_ATTRIB
+	CloseWrite = unix.IN_CLOSE_WRITE
+)
+
 var (
 	ErrNonExistentWatch = errors.New("inotify: can't remove non-existent watch")
+	ErrClosed           = errors.New("inotify: watcher already closed")
+	ErrEventOverflow    = errors.New("inotify: queue or buffer overflow")
+	ErrInvalildFD       = errors.New("inotify: invalid file descriptor")
 )
+
 type Inotify struct {
 	Events chan Event
 	Errors chan error
@@ -93,6 +127,30 @@ func (w *watches) removePath(path string) ([]uint32, error) {
 	return wds, nil
 }
 
+func (w *watches) updatePath(path string, f func(*watch) (*watch, error)) error {
+	var existing *watch
+	wd, ok := w.path[path]
+	if ok {
+		existing = w.wd[wd]
+	}
+
+	upd, err := f(existing)
+	if err != nil {
+		return err
+	}
+	if upd != nil {
+		w.add(upd)
+		// w.wd[upd.wd] = upd
+		// w.path[upd.path] = upd.wd
+
+		if upd.wd != wd {
+			delete(w.wd, wd)
+		}
+	}
+
+	return nil
+}
+
 func NewWatcher() (*Inotify, error) {
 	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
 	if fd == -1 {
@@ -115,6 +173,117 @@ func NewWatcher() (*Inotify, error) {
 	go i.readEvents()
 	return i, err
 }
+
+func (w *Inotify) register(path string, flags uint32, recurse bool) error {
+	return w.watches.updatePath(path, func(existing *watch) (*watch, error) {
+		if existing != nil {
+			flags |= existing.flags | unix.IN_MASK_ADD
+		}
+
+		wd, err := unix.InotifyAddWatch(w.fd, path, flags)
+		if wd == -1 {
+			return nil, err
+		}
+
+		if e, ok := w.watches.wd[uint32(wd)]; ok {
+			return e, nil
+		}
+
+		if existing == nil {
+			return &watch{
+				wd:      uint32(wd),
+				path:    path,
+				flags:   flags,
+				recurse: recurse,
+			}, nil
+		}
+
+		existing.wd = uint32(wd)
+		existing.flags = flags
+		return existing, nil
+	})
+}
+
+func (w *Inotify) Add(name string) error {
+	return w.AddWith(name, Create|Write|Remove|Rename|Chmod|CloseWrite)
+}
+
+func (w *Inotify) AddWith(path string, flags uint32) error {
+	select {
+	case <-w.done:
+		return ErrClosed
+	default:
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	path, recurse := recursivePath(path)
+	if recurse {
+		return filepath.WalkDir(path, func(root string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() {
+				if root == path {
+					return fmt.Errorf("inotify: not a directory: %q", path)
+				}
+				return nil
+			}
+			return w.register(root, flags, true)
+		})
+	}
+	return w.register(path, flags, false)
+}
+
+func (w *Inotify) Close() error {
+	close(w.done)
+	err := w.inotifyFile.Close()
+	if err != nil {
+		return err
+	}
+	<-w.doneResp // wait for readEvents() to finish
+	return nil
+}
+
+func (w *Inotify) Remove(name string) error {
+	select {
+	case <-w.done:
+		return ErrClosed
+	default:
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.remove(filepath.Clean(name))
+}
+
+func (w *Inotify) remove(name string) error {
+	wds, err := w.watches.removePath(name)
+	if err != nil {
+		return err
+	}
+
+	for _, wd := range wds {
+		_, err := unix.InotifyRmWatch(w.fd, wd)
+		if err != nil {
+			if errno, ok := err.(syscall.Errno); ok {
+				switch errno {
+				case syscall.EBADF:
+					return ErrInvalildFD
+				case syscall.EINVAL:
+					continue
+				default:
+					return fmt.Errorf("unexpected error removing watch: %w", err)
+				}
+			} else {
+				return fmt.Errorf("unexpected error type: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
 func (w *Inotify) readEvents() {
 	defer func() {
 		close(w.Errors)

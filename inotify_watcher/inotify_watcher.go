@@ -47,11 +47,15 @@ type Inotify struct {
 
 	done     chan struct{}
 	doneResp chan struct{}
+
+	cookies     [10]moveCookie
+	cookieIndex uint8
 }
 
 type Event struct {
-	Name string
-	Op   uint32
+	Name        string
+	Op          uint32
+	RenamedFrom string
 }
 
 type watches struct {
@@ -64,6 +68,10 @@ type watch struct {
 	flags   uint32
 	path    string
 	recurse bool
+}
+type moveCookie struct {
+	cookie uint32
+	path   string
 }
 
 func NewWatches() *watches {
@@ -340,27 +348,6 @@ func (w *Inotify) readEvents() {
 				return
 			}
 
-			// TODO: move to handleEvent
-			if ev.Op&unix.IN_CREATE == unix.IN_CREATE || ev.Op&unix.IN_MOVED_TO == unix.IN_MOVED_TO {
-				info, err := os.Stat(ev.Name)
-				if err != nil {
-					if !w.sendError(err) {
-						return
-					}
-					continue
-				}
-				if info.IsDir() {
-					if err := w.Add(ev.Name); err != nil {
-						if !w.sendError(err) {
-							return
-						}
-
-					}
-				}
-				// if err == nil && info.IsDir() {
-				// 	w.AddWith(ev.Name, Create|Write|Remove|Rename|Chmod|CloseWrite)
-				// }
-			}
 			if !w.sendEvent(ev) {
 				return
 			}
@@ -384,31 +371,25 @@ func (w *Inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[unix.SizeofInoti
 	mask := inEvent.Mask
 	nameLen := inEvent.Len
 
-	var name string
+	var name string = watch.path
 	if nameLen > 0 {
 		bytes := (*[unix.PathMax]byte)(unsafe.Pointer(&buf[offset+unix.SizeofInotifyEvent]))
-		name = string(bytes[:nameLen])
-		name = strings.TrimRight(name, "\x00")
+		name += "/" + strings.TrimRight(string(bytes[:nameLen]), "\x00")
 	}
 
-	// watch := w.watches.byWd(uint32(wd))
-	// if watch == nil {
-	// 	return Event{}, true
-	// }
-
-	fullPath := watch.path
-	if name != "" {
-		fullPath = filepath.Join(fullPath, name)
-	}
-	isDir := inEvent.Mask&unix.IN_ISDIR == unix.IN_ISDIR
-
-	switch {
-	case inEvent.Mask&unix.IN_IGNORED != 0 || inEvent.Mask&unix.IN_UNMOUNT != 0:
+	if inEvent.Mask&unix.IN_IGNORED != 0 || inEvent.Mask&unix.IN_UNMOUNT != 0 {
 		w.watches.remove(watch)
 		return Event{}, true
-	case inEvent.Mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF:
+	}
+	if inEvent.Mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF {
 		w.watches.remove(watch)
-	case inEvent.Mask&unix.IN_MOVE_SELF == unix.IN_MOVE_SELF && !watch.recurse:
+	}
+
+	if inEvent.Mask&unix.IN_MOVE_SELF == unix.IN_MOVE_SELF {
+		if watch.recurse { // Do nothing
+			return Event{}, true
+		}
+
 		if err := w.remove(watch.path); err != nil && !errors.Is(err, ErrNonExistentWatch) {
 			if !w.sendError(err) {
 				return Event{}, false
@@ -416,21 +397,61 @@ func (w *Inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[unix.SizeofInoti
 		}
 	}
 
-	if watch.recurse && isDir && (inEvent.Mask&unix.IN_CREATE != 0) {
-		if err := w.register(fullPath, watch.flags, true); err != nil {
-			if !w.sendError(err) {
-				return Event{}, false
-			}
-
+	if inEvent.Mask&unix.IN_DELETE_SELF != 0 {
+		_, ok := w.watches.path[filepath.Dir(watch.path)]
+		if ok {
+			return Event{}, true
 		}
 	}
 
-	event := Event{
-		Name: fullPath,
-		Op:   mask,
+	event := w.newEvent(name, mask, inEvent.Cookie)
+	if watch.recurse {
+		isDir := inEvent.Mask&unix.IN_ISDIR == unix.IN_ISDIR
+
+		if isDir && (event.Op&unix.IN_MOVED_TO != 0) {
+			if err := w.register(event.Name, watch.flags, true); err != nil {
+				if !w.sendError(err) {
+					return Event{}, false
+				}
+			}
+			if event.RenamedFrom != "" {
+				for k, ww := range w.watches.wd {
+					if k == watch.wd || ww.path == event.Name {
+						continue
+					}
+					if strings.HasPrefix(ww.path, event.RenamedFrom) {
+						ww.path = strings.Replace(ww.path, event.RenamedFrom, event.Name, 1)
+						w.watches.wd[k] = ww
+					}
+				}
+			}
+		}
 	}
 
 	return event, true
+}
+
+func (w *Inotify) newEvent(name string, mask, cookie uint32) Event {
+	e := Event{Name: name, Op: mask}
+	if cookie != 0 {
+		if mask&unix.IN_MOVED_FROM == unix.IN_MOVED_FROM {
+			w.cookies[w.cookieIndex] = moveCookie{cookie: cookie, path: e.Name}
+			w.cookieIndex++
+			if w.cookieIndex > 9 {
+				w.cookieIndex = 0
+			}
+		} else if mask&unix.IN_MOVED_TO == unix.IN_MOVED_TO {
+			var prev string
+			for _, c := range w.cookies {
+				if c.cookie == cookie {
+					prev = c.path
+					break
+				}
+			}
+			e.RenamedFrom = prev
+		}
+	}
+	return e
 }
 
 func recursivePath(path string) (string, bool) {
